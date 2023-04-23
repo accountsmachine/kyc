@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+
+from aiohttp import web, ClientSession
+import asyncio
+import logging
+import base64
+import json
+import sys
+from mappings import mappings
+import datetime
+import os
+
+logger = logging.getLogger("api.company-register")
+logger.setLevel(logging.INFO)
+
+class CompanyRegisterApi():
+
+    def __init__(self, config):
+
+        try:
+            self.url = config["companies-service-url"]
+        except:
+            self.url = "https://api.company-information.service.gov.uk"
+
+        key = config["companies-service-api-key"]
+        self.auth = base64.b64encode(
+            (key + ":").encode("utf-8")
+        ).decode("utf-8")
+
+    async def get(self, id):
+
+        try:
+
+            logger.info("Lookup %s", id)
+
+            async with ClientSession() as session:
+
+                headers = {
+                    "Authorization": "Basic " + self.auth
+                }
+
+                async with session.get(
+                        self.url + "/company/" + id,
+                        headers=headers
+                ) as resp:
+
+                    if resp.status != 200:
+                        raise RuntimeError("Status " + str(resp.status))
+
+                    ci = await resp.json()
+
+                    return ci
+
+        except Exception as e:
+            logger.debug("Exception: %s", e)
+
+    async def get_pscs(self, id):
+
+        try:
+
+            logger.info("Lookup %s", id)
+
+            async with ClientSession() as session:
+
+                headers = {
+                    "Authorization": "Basic " + self.auth
+                }
+
+                async with session.get(
+                        self.url + "/company/" + id +
+                        "/persons-with-significant-control",
+                        headers=headers
+                ) as resp:
+
+                    if resp.status != 200:
+                        raise RuntimeError("Status " + str(resp.status))
+
+                    ci = await resp.json()
+
+                    return ci
+
+        except Exception as e:
+            logger.debug("Exception: %s", e)
+            raise e
+
+    async def get_officers(self, id):
+
+        try:
+
+            logger.info("Lookup %s", id)
+
+            async with ClientSession() as session:
+
+                headers = {
+                    "Authorization": "Basic " + self.auth
+                }
+
+                items = []
+
+                start = 0
+                page = 100
+
+                while True:
+                    async with session.get(
+                            self.url + "/company/" + id +
+                            "/officers?items_per_page=" + str(page) +
+                            "&start_index=" + str(start),
+                            headers=headers
+                    ) as resp:
+
+                        if resp.status != 200:
+                            raise RuntimeError("Status " + str(resp.status))
+
+                        ci = await resp.json()
+
+                        items.extend(ci["items"])
+
+                        if len(items) == ci["total_results"]:
+                            return {
+                                "items": items
+                            }
+
+                        start += len(ci["items"])
+
+        except Exception as e:
+            logger.debug("Exception: %s", e)
+            raise e
+
+    async def get_filings(self, id):
+
+        try:
+
+            logger.info("Lookup %s", id)
+
+            async with ClientSession() as session:
+
+                headers = {
+                    "Authorization": "Basic " + self.auth
+                }
+
+                items = []
+
+                start = 0
+                page = 100
+
+                while True:
+                    async with session.get(
+                            self.url + "/company/" + id +
+                            "/filing-history?items_per_page=" + str(page) +
+                            "&start_index=" + str(start),
+                            headers=headers
+                    ) as resp:
+
+                        if resp.status != 200:
+                            raise RuntimeError("Status " + str(resp.status))
+
+                        ci = await resp.json()
+
+#                         print(json.dumps(ci, indent=4))
+
+                        items.extend(ci["items"])
+
+                        
+
+                        if len(items) == ci["total_count"]:
+                            return {
+                                "items": items
+                            }
+
+                        start += len(ci["items"])
+
+#                     return ci
+
+        except Exception as e:
+            logger.debug("Exception: %s", e)
+            raise e
+
+class CompanySearch:
+
+    def __init__(self, key):
+
+        config = { "companies-service-api-key": key }
+        self.api = CompanyRegisterApi(config)
+
+        self.cutoff = datetime.datetime.utcnow().date()
+        self.cutoff -= datetime.timedelta(days=365 * 3)
+
+    async def search(self, id):
+
+        entity = ("company", id)
+        self.queue = [entity]
+        self.complete = set()
+
+        await self.run()
+
+    async def run(self):
+
+        while len(self.queue) > 0:
+
+            entity = self.queue.pop()
+            self.complete.add(entity)
+
+            if entity[0] == "company":
+
+                await self.handle_company(entity[1])
+
+    def parse_address(self, addr):
+
+        (addr1, addr2, town, postcode) = (
+            addr.get("address_line_1", "--"),
+            addr.get("address_line_2", "--"),
+            addr.get("locality"),
+            addr.get("postal_code"),
+        )
+
+        return (f"{addr1}, {addr2}, {town}, {postcode}")
+
+    async def handle_company(self, id):
+
+        while len(id) < 8:
+            id = "0" + id
+
+        cmp = await self.api.get(id)
+        if cmp is None:
+            print()
+            print("Company " + id + ": no information")
+            return
+
+#         print(json.dumps(cmp, indent=4))
+
+        number = cmp["company_number"]
+        name = cmp["company_name"]
+
+        print()
+        title = f"Company {number}: {name}"
+        print(title)
+        print("-" * len(title))
+
+        print("Jurisdiction: ", cmp["jurisdiction"])
+        print("Incorporated: ", cmp["date_of_creation"])
+        print("Type:         ", cmp["type"])
+        print("Status:       ", cmp["company_status"])
+
+        if "has_been_liquidated" in cmp:
+            print("Liquidated:   ", cmp["has_been_liquidated"])
+
+        addr = self.parse_address(cmp["registered_office_address"])
+        print(f"Address:       {addr}")
+
+        last_accounts = cmp["accounts"]["last_accounts"].get("made_up_to", "--")
+        overdue = cmp["accounts"].get("next_accounts", {}).get("overdue", False)
+        print(f"Last filed:    {last_accounts}")
+        print(f"A/c overdue:   {overdue}")
+
+        if "previous_company_names" in cmp:
+            for prev in cmp["previous_company_names"]:
+                pname, pfrom, pto = (
+                    prev["name"], prev["effective_from"], prev["ceased_on"]
+                )
+                print(f"Previously:    {pname} ({pfrom} - {pto})")
+
+        await self.handle_officers(id)
+        await self.handle_pscs(id)
+        await self.handle_filings(id)
+
+#        print(json.dumps(cmp, indent=4))
+
+    async def handle_pscs(self, id):
+
+        pscs = await self.api.get_pscs(id)
+
+        for psc in pscs["items"]:
+
+            if psc["kind"] == "corporate-entity-person-with-significant-control":
+
+                await self.handle_psc_company(psc)
+
+            if psc["kind"] == "individual-person-with-significant-control":
+
+                await self.handle_psc_person(psc)
+
+#         print(json.dumps(pscs, indent=4))
+
+    async def handle_psc_company(self, psc):
+
+        pname = psc["name"]
+        pcountry = psc["identification"]["country_registered"]
+        pid = psc["identification"]["registration_number"]
+
+        print(f"PSC:           {pid}: {pname} ({pcountry})")
+
+        entity = ("company", pid)
+
+        if entity not in self.complete:
+            self.queue.insert(0, entity)
+
+#         print(json.dumps(psc, indent=4))
+
+    async def handle_psc_person(self, psc):
+
+        pname = psc["name"]
+        pnationality = psc["nationality"]
+        pyear = psc["date_of_birth"]["year"]
+
+        print(f"PSC:           {pname}, {pnationality}, YOB {pyear}")
+
+#         print(json.dumps(psc, indent=4))
+
+    async def handle_officer(self, officer):
+
+#         print(json.dumps(officer, indent=4))
+
+        oname = officer["name"]
+
+        onationality = officer.get("nationality", "--")
+        oyear = officer.get("date_of_birth", {}).get("year", "--")
+
+        oresigned = officer.get("resigned_on", None)
+        orole = officer.get("officer_role", "--")
+
+        if oresigned is None:
+            print(f"Officer:       {orole}: {oname}, {onationality}, YOB {oyear}")
+
+
+    async def handle_officers(self, id):
+
+        officers = await self.api.get_officers(id)
+
+        for officer in officers["items"]:
+
+            await self.handle_officer(officer)
+
+#         print(json.dumps(officers, indent=4))
+
+    async def handle_filing(self, filing):
+
+        date = datetime.datetime.fromisoformat(filing["date"]).date()
+
+        if date < self.cutoff:
+            return
+
+        if "annotations" in filing:
+            for anno in filing["annotations"]:
+                text = anno["annotation"]
+                print(f"Annotation:    {date}: {text}")
+            return
+
+        category = filing.get("category", None)
+        description = filing["description"]
+        values = filing.get("description_values", {})
+
+        try:
+
+            text = mappings[description]
+            text = text.replace("**", "")
+            text = text.format(**values)
+            print(f"Filing:        {date}: {text}")
+
+        except:
+            
+            print(f"Filing:        {date}: {description}")
+
+#         print(json.dumps(filing, indent=4))
+
+    async def handle_filings(self, id):
+
+        filings = await self.api.get_filings(id)
+
+        for filing in filings["items"]:
+            await self.handle_filing(filing)
+
+#         print(json.dumps(officers, indent=4))
+
+
+async def main(id):
+
+    api_key = os.getenv("KYC_API_KEY")
+    cr = CompanySearch("0521106a-c2ae-47af-9d5d-e8984bb44424")
+
+    try:
+        await cr.search(id)
+    except Exception as e:
+        print(e)
+
+asyncio.run(main(sys.argv[1]))
+
